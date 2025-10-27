@@ -1,2 +1,11 @@
-venv/
+# Environments & configuration
 .env
+.venv/
+venv/
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Generated media
+*.m4a
