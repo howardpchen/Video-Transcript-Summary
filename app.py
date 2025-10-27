@@ -1,59 +1,114 @@
+import argparse
 import os
-import streamlit as st
-from dotenv import load_dotenv
-from youtube_transcript_api import YouTubeTranscriptApi
+import subprocess
+from pathlib import Path
+
 import google.generativeai as genai
-
-# Load environment variables
-load_dotenv()
-
-# Configure Google GenerativeAI
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-
-# Prompt for summarization
-prompt = """Welcome, Video Summarizer! Your task is to distill the essence of a given YouTube video transcript into a concise summary. Your summary should capture the key points and essential information, presented in bullet points, within a 250-word limit. Let's dive into the provided transcript and extract the vital details for our audience."""
+from dotenv import load_dotenv
 
 
-# Function to extract transcript details from a YouTube video URL
-def extract_transcript_details(youtube_video_url):
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert video files to M4A and generate transcripts using Gemini 2.5 Flash."
+        )
+    )
+    parser.add_argument(
+        "--dir",
+        required=True,
+        type=Path,
+        help="Directory containing the source video files.",
+    )
+    parser.add_argument(
+        "--format",
+        default="mp4",
+        help="Video file extension to process (default: mp4).",
+    )
+    return parser.parse_args()
+
+
+def ensure_env_configured() -> None:
+    load_dotenv()
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY must be set in the environment or .env file.")
+    genai.configure(api_key=api_key)
+
+
+def convert_to_m4a(video_path: Path) -> Path:
+    audio_path = video_path.with_suffix(".m4a")
+    if audio_path.exists():
+        print(f"[skip] {audio_path.name} already exists.")
+        return audio_path
+
+    print(f"[ffmpeg] Converting {video_path.name} -> {audio_path.name}")
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "aac",
+        str(audio_path),
+    ]
     try:
-        video_id = youtube_video_url.split("=")[1]
-        transcript_text = YouTubeTranscriptApi.get_transcript(video_id)
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"ffmpeg failed on {video_path.name}: {exc.stderr.decode().strip()}"
+        ) from exc
 
-        transcript = ""
-        for i in transcript_text:
-            transcript += " " + i["text"]
-
-        return transcript
-    except Exception as e:
-        raise e
+    return audio_path
 
 
-# Function to generate summary using Google Gemini Pro
-def generate_gemini_content(transcript_text, prompt):
-    model = genai.GenerativeModel("gemini-pro")
-    response = model.generate_content(prompt + transcript_text)
-    return response.text
+def transcribe_audio(audio_path: Path) -> str:
+    print(f"[gemini] Uploading {audio_path.name}")
+    uploaded_file = genai.upload_file(path=str(audio_path))
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    prompt = (
+        "Transcribe the provided audio file verbatim. "
+        "Return plain text without extra commentary."
+    )
+    response = model.generate_content([prompt, uploaded_file])
+    transcript_text = (response.text or "").strip()
+
+    # Attempt to delete uploaded file to avoid storage buildup.
+    try:
+        genai.delete_file(uploaded_file.name)
+    except Exception:
+        pass
+
+    if not transcript_text:
+        raise RuntimeError(f"No transcript returned for {audio_path.name}.")
+    return transcript_text
 
 
-# Streamlit UI
-st.title(
-    "Gemini YouTube Transcript Summarizer: Extract Key Insights from YouTube Videos"
-)
-youtube_link = st.text_input("Enter YouTube Video Link:")
+def process_directory(target_dir: Path, file_extension: str) -> None:
+    if not target_dir.is_dir():
+        raise NotADirectoryError(f"{target_dir} is not a directory.")
 
-if youtube_link:
-    video_id = youtube_link.split("=")[1]
-    st.image(f"http://img.youtube.com/vi/{video_id}/0.jpg", use_column_width=True)
+    video_files = sorted(target_dir.glob(f"*.{file_extension.lstrip('.')}"))
+    if not video_files:
+        print(f"No *.{file_extension} files found in {target_dir}.")
+        return
 
-# Button to trigger summary generation
-if st.button("Get Detailed Notes"):
-    transcript_text = extract_transcript_details(youtube_link)
+    for video_file in video_files:
+        audio_file = convert_to_m4a(video_file)
+        transcript_path = video_file.with_suffix(".txt")
+        if transcript_path.exists():
+            print(f"[skip] Transcript already exists for {video_file.name}.")
+            continue
 
-    if transcript_text:
-        # Generate summary using Gemini Pro
-        summary = generate_gemini_content(transcript_text, prompt)
+        transcript = transcribe_audio(audio_file)
+        transcript_path.write_text(transcript, encoding="utf-8")
+        print(f"[done] Wrote transcript to {transcript_path}")
 
-        # Display summary
-        st.markdown("## Detailed Notes:")
-        st.write(summary)
+
+def main() -> None:
+    args = parse_args()
+    ensure_env_configured()
+    process_directory(args.dir, args.format)
+
+
+if __name__ == "__main__":
+    main()
